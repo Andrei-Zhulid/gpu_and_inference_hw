@@ -1,3 +1,5 @@
+import statistics
+
 import torch
 
 
@@ -12,8 +14,7 @@ import torch
 
 def lowest_ai_fn(x: torch.Tensor) -> torch.Tensor:
     """Lowest arithmetic intensity baseline (0 FLOP/Byte)."""
-    # TODO (1 line): implement a lowest-AI op
-    pass
+    return x.clone()  # pure memory copy: read once, write once, ~0 FLOPs
 
 
 # TASK 1b: Implement a function with configurable arithmetic intensity.
@@ -37,10 +38,12 @@ def make_compute_fn(num_ops: int, compiled: bool = True):
     """Return an eager or compiled function whose work scales with num_ops."""
 
     def fn(x: torch.Tensor) -> torch.Tensor:
-        pass
+        acc = x
+        for _ in range(num_ops):
+            acc = acc * x + x  # one FMA-style step: 2 FLOPs/element (mul + add)
+        return acc
 
-    # TODO (1 line): return either `fn` or `torch.compile(fn)` based on `compiled`
-    pass
+    return torch.compile(fn) if compiled else fn
 
 
 # ============================================================================
@@ -62,8 +65,32 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
         fn(*args)
     torch.cuda.synchronize()
 
-    # TODO: time `rep` runs using CUDA events and return median latency (ms)
-    pass
+    # L2 cache-flush buffer. Re-zeroing it before each timed run evicts whatever
+    # the previous run left resident in L2, so every run pays a realistic memory
+    # cost instead of getting an artificial cache hit. This matters for the small
+    # matmul inputs (a few MB) that otherwise fit entirely in the H100/L40S L2
+    # (~50 MB) and would report inflated bandwidth. The 256 MB element-wise input
+    # already exceeds L2, so the flush is a no-op effect there. Same approach as
+    # triton.testing.do_bench. (256 MB comfortably exceeds any current L2.)
+    # https://www.speechmatics.com/company/articles-and-news/timing-operations-in-pytorch
+    cache_flush = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
+
+    # Time each of `rep` runs with a dedicated pair of CUDA events. Events are
+    # recorded on the GPU stream, so elapsed_time() measures pure device time
+    # (excluding Python/CPU launch overhead) once we synchronize at the end.
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+
+    for i in range(rep):
+        cache_flush.zero_()  # evict L2 before this run; queued before the start event, so not timed
+        start_events[i].record()
+        fn(*args)
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+
+    times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    return statistics.median(times_ms)
 
 
 # TASK 3: Compute element-wise operation metrics from measured runtime.
@@ -83,8 +110,28 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
 
 
 def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, variant):
-    # TODO: compute total FLOPs, arithmetic intensity, and achieved FLOP/s
-    pass
+    # Each `acc = acc * x + x` iteration does 2 FLOPs per element (one multiply,
+    # one add), regardless of how PyTorch schedules the work.
+    flops_per_element = 2 * num_ops
+    total_flops = num_elements * flops_per_element
+
+    if variant == "compiled":
+        # Fused kernel: each element is read once and written once at the kernel
+        # boundary; intermediates stay in registers. AI = num_ops / bytes_per_el,
+        # so it grows linearly with num_ops and the point moves rightward.
+        total_bytes = num_elements * 2 * bytes_per_element
+    else:  # eager
+        # Eager launches a separate multiply and add kernel each iteration. Each
+        # binary element-wise op reads 2 operands and writes 1 result (3 tensor
+        # accesses), materializing intermediates to global memory. So traffic
+        # scales with num_ops just like the FLOPs do, leaving AI roughly
+        # constant -> eager points don't move right on the roofline.
+        ops_per_iter = 2  # multiply + add
+        accesses_per_op = 3  # 2 reads + 1 write
+        total_bytes = num_ops * ops_per_iter * accesses_per_op * num_elements * bytes_per_element
+
+    ai = total_flops / total_bytes
+    achieved_flops = total_flops / (ms * 1e-3)
     return total_flops, ai, achieved_flops
 
 
