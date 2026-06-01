@@ -22,20 +22,42 @@ GPU_SPECS = {
         "peak_flops": 91.6e12,  # 91.6 TFLOP/s FP32
         "peak_bw": 864e9,  # 864 GB/s GDDR6 bandwidth
     },
+    "M4_10GPU": {
+        "label": "Apple M4 10-core GPU, 120GB/s unified memory",
+        "peak_flops": 4.3e12,  # ~4.3 TFLOP/s FP32, estimated; Apple does not publish this
+        "peak_bw": 120e9,  # 120 GB/s unified memory bandwidth
+    }
 }
 
 
-def _get_gpu_specs():
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. Please set the GPU roofline settings yourself.")
+def _get_device():
+    """Pick the best available accelerator: CUDA, then Apple MPS, then CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
-    device_name = torch.cuda.get_device_name(0)
-    for gpu_key, specs in GPU_SPECS.items():
-        if gpu_key in device_name:
-            return specs
+
+DEVICE = _get_device()
+
+
+def _get_gpu_specs():
+    if DEVICE.type == "cuda":
+        device_name = torch.cuda.get_device_name(0)
+        for gpu_key, specs in GPU_SPECS.items():
+            if gpu_key in device_name:
+                return specs
+        raise RuntimeError(
+            f"Unsupported GPU '{device_name}'. Please set the roofline GPU settings yourself."
+        )
+
+    if DEVICE.type == "mps":
+        # No programmatic spec query on MPS; assume the Apple-silicon entry.
+        return GPU_SPECS["M4_10GPU"]
 
     raise RuntimeError(
-        f"Unsupported GPU '{device_name}'. Please set the roofline GPU settings yourself."
+        "No CUDA or MPS device available. Please set the GPU roofline settings yourself."
     )
 
 
@@ -65,7 +87,7 @@ def measure_roofline_points(
 ):
     """Run operations with varying arithmetic intensity and measure performance."""
     n = 64 * 1024 * 1024  # 64M elements = 256 MB in float32
-    x = torch.randn(n, device="cuda", dtype=torch.float32)
+    x = torch.randn(n, device=DEVICE, dtype=torch.float32)
 
     bytes_per_element = 4  # float32
     total_transfer_bytes = n * 2 * bytes_per_element  # read + write
@@ -126,8 +148,8 @@ def measure_roofline_points(
 
     # Benchmark matrix multiplication (very high arithmetic intensity)
     for m in [1024, 2048, 4096]:
-        a = torch.randn(m, m, device="cuda", dtype=torch.float32)
-        b = torch.randn(m, m, device="cuda", dtype=torch.float32)
+        a = torch.randn(m, m, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(m, m, device=DEVICE, dtype=torch.float32)
         fn = lambda a=a, b=b: torch.mm(a, b)
         ms = benchmark_fn(fn, warmup=25, rep=100)
 

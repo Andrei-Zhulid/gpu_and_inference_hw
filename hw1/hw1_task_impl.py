@@ -1,6 +1,27 @@
 import statistics
+import time
 
 import torch
+
+
+def _get_device():
+    """Pick the best available accelerator: CUDA, then Apple MPS, then CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = _get_device()
+
+
+def _synchronize():
+    """Device-agnostic barrier (no-op on CPU)."""
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    elif DEVICE.type == "mps":
+        torch.mps.synchronize()
 
 
 # ============================================================================
@@ -63,7 +84,7 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
     # Warmup (triggers torch.compile on first call, then warms caches)
     for _ in range(warmup):
         fn(*args)
-    torch.cuda.synchronize()
+    _synchronize()
 
     # L2 cache-flush buffer. Re-zeroing it before each timed run evicts whatever
     # the previous run left resident in L2, so every run pays a realistic memory
@@ -73,23 +94,37 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
     # already exceeds L2, so the flush is a no-op effect there. Same approach as
     # triton.testing.do_bench. (256 MB comfortably exceeds any current L2.)
     # https://www.speechmatics.com/company/articles-and-news/timing-operations-in-pytorch
-    cache_flush = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    cache_flush = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=DEVICE)
 
-    # Time each of `rep` runs with a dedicated pair of CUDA events. Events are
-    # recorded on the GPU stream, so elapsed_time() measures pure device time
-    # (excluding Python/CPU launch overhead) once we synchronize at the end.
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    if DEVICE.type == "cuda":
+        # Time each of `rep` runs with a dedicated pair of CUDA events. Events are
+        # recorded on the GPU stream, so elapsed_time() measures pure device time
+        # (excluding Python/CPU launch overhead) once we synchronize at the end.
+        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
 
-    for i in range(rep):
-        cache_flush.zero_()  # evict L2 before this run; queued before the start event, so not timed
-        start_events[i].record()
-        fn(*args)
-        end_events[i].record()
+        for i in range(rep):
+            cache_flush.zero_()  # evict L2 before this run; queued before the start event, so not timed
+            start_events[i].record()
+            fn(*args)
+            end_events[i].record()
 
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    else:
+        # MPS/CPU: CUDA events are unavailable, so time each run on the host with
+        # perf_counter, synchronizing around it so we capture device execution
+        # time rather than just async dispatch. This adds a per-run sync, which
+        # is acceptable here since the work per run is large relative to the sync.
+        times_ms = []
+        for _ in range(rep):
+            cache_flush.zero_()
+            _synchronize()
+            t0 = time.perf_counter()
+            fn(*args)
+            _synchronize()
+            times_ms.append((time.perf_counter() - t0) * 1e3)
 
-    times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
     return statistics.median(times_ms)
 
 
@@ -153,3 +188,49 @@ def compute_elementwise_metrics(num_elements, num_ops, bytes_per_element, ms, va
 # becoming the bottleneck?
 #
 # Q4. Why do the eager `ops-K` points look so different from the compiled ones?
+#
+# ----------------------------------------------------------------------------
+# ANSWERS  (numbers from the run on an Apple M4: ~4.3 TFLOP/s FP32,
+#           120 GB/s memory, ridge around 36 FLOP/Byte)
+# ----------------------------------------------------------------------------
+#
+# A1. These numbers are from my Apple M4 run. (I assume the question is about an
+# H100, where this holds from `1 ops` through `64 ops`. On my M4 the flat region
+# ends a bit sooner — around `32 ops` — because its real compute ceiling is well
+# below the 4.3 TFLOP/s spec, so it turns compute-bound at a lower intensity.)
+# The runtime barely moves across that range (it stays around 5.6 ms) because
+# the kernel is still just shuffling memory: it reads the 256 MB input once and
+# writes 256 MB back, which is about 5.6 ms at the ~95 GB/s measured. The actual
+# multiply-adds are basically free here since they happen while we're waiting on
+# memory anyway. So adding more ops just packs more FLOPs into the same ~5.6 ms,
+# and FLOP/s (FLOPs divided by time) just keeps going up. Nothing got faster,
+# there's simply more useful work riding along on the same memory traffic.
+#
+# A2. A 1024x1024 matmul is small (~2 GFLOP), so on a big GPU it's over almost
+# instantly and the fixed costs take over: launching the kernel, leftover tiles
+# that don't evenly fill all the cores, and the fact that plain FP32 doesn't
+# touch the tensor cores. There just isn't enough work to get the chip up to
+# speed. The 128-op kernel, on the other hand, is one big pass over 256 MB that
+# keeps everything busy, so it can report a higher FLOP/s. (Fun fact: my M4 run
+# was the other way round - matmul 1024 came out ahead - but all the matmuls
+# still only hit ~1.4-1.6 TFLOP/s, nowhere near the 4.3 ceiling, for the same
+# reasons.)
+#
+# A3. It means we've stopped being limited by memory and started being limited
+# by the math itself. Up to 32 ops time was flat, but 64 -> 128 ops jumps from
+# 7 to 15 ms and the throughput drops off a cliff. The data isn't the
+# bottleneck anymore, the arithmetic is, so now doubling the ops roughly
+# doubles the time. It also doesn't help that each op depends on the previous
+# one (acc = acc*x + x), so they can't overlap and we're partly just waiting on
+# that chain.
+#
+# A4. Same math, very different memory behavior. The compiled version fuses the
+# whole loop into one kernel, so it reads and writes once and everything in
+# between stays in registers - that's why its arithmetic intensity grows with
+# the number of ops and the blue points slide to the right. Eager runs each
+# multiply and each add as its own kernel and writes the result back to memory
+# every time, so the memory traffic grows right along with the FLOPs and the
+# intensity never changes (it's stuck around 0.08). That's why the orange
+# points (the eager `ops-K`) just stack up in the same spot on the left and the
+# runtime climbs steadily (13 ms up to ~2.2 s) - eager never gets off the
+# memory ceiling no matter how many ops you throw at it.

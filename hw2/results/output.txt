@@ -1,0 +1,73 @@
+============================================================
+HW2: LLM Inference Optimization
+Model: Tiny random Llama (2 layers, d_model=2048)
+============================================================
+
+--- Part 1: Slow baseline ---
+--------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                        Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls
+--------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                  aten::item         0.00%     122.127us        57.09%        1.710s      23.748ms            72
+                   aten::_local_scalar_dense        57.08%        1.710s        57.08%        1.710s      23.747ms            72
+          aten::scaled_dot_product_attention         0.00%     131.165us        15.75%     471.825ms      19.659ms            24
+    aten::_scaled_dot_product_attention_math         0.02%     619.380us        15.75%     471.694ms      19.654ms            24
+                                aten::matmul         0.02%     583.419us         9.56%     286.459ms       4.774ms            60
+                                   aten::bmm         9.51%     284.944ms         9.51%     284.944ms       4.749ms            60
+                         aten::_safe_softmax         0.01%     385.703us         7.04%     210.818ms       8.784ms            24
+                                 aten::where         3.40%     101.821ms         4.86%     145.429ms       2.020ms            72
+                                   aten::cat         4.58%     137.054ms         4.58%     137.054ms       1.142ms           120
+                                aten::arange         1.92%      57.618ms         3.85%     115.250ms       4.802ms            24
+                                  aten::mean         3.64%     109.155ms         3.64%     109.155ms       1.819ms            60
+                             aten::embedding         0.01%     414.580us         3.18%      95.109ms       7.926ms            12
+                          aten::index_select         3.15%      94.484ms         3.16%      94.590ms       7.882ms            12
+                                 aten::copy_         3.05%      91.433ms         3.05%      91.433ms     421.349us           217
+                                    aten::to         0.01%     256.440us         2.58%      77.406ms     150.012us           516
+                              aten::_to_copy         0.01%     406.713us         2.58%      77.150ms     401.822us           192
+                                   aten::all         2.30%      68.992ms         2.30%      68.992ms       2.875ms            24
+                                  aten::silu         2.16%      64.722ms         2.16%      64.773ms       2.699ms            24
+                                   aten::pow         2.07%      62.067ms         2.08%      62.226ms       1.037ms            60
+                              aten::isneginf         1.85%      55.509ms         1.85%      55.509ms       2.313ms            24
+--------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 2.995s
+
+Chrome trace written to /Users/andrei_zhulid/Development/AI-performance-engineering/gpu_and_inference_hw_CC/hw2/results/v0_slow_trace.json
+Slow: 128 tokens in 26.53s (4.8 tok/s)
+Token preview: [3583, 3830, 1839, 953, 465, 3087, 537, 83]
+
+--- Part 2: Optimized ---
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                                Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg    # of Calls
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+                  aten::scaled_dot_product_attention         0.03%     633.292us        51.41%        1.035s      43.112ms            24
+    aten::_scaled_dot_product_attention_math_for_mps        51.38%        1.034s        51.38%        1.034s      43.085ms            24
+                                        aten::linear        14.10%     283.681ms        14.10%     283.820ms       1.577ms           180
+                                         aten::copy_         8.47%     170.540ms         8.47%     170.540ms     658.455us           259
+                                            aten::to         0.02%     409.545us         7.64%     153.793ms     435.676us           353
+                                      aten::_to_copy         0.02%     303.746us         7.62%     153.384ms     596.825us           257
+                                        aten::matmul         0.00%      87.200us         5.97%     120.145ms      10.012ms            12
+                                           aten::bmm         5.96%     119.961ms         5.96%     119.961ms       9.997ms            12
+                                           aten::cat         5.06%     101.857ms         5.06%     101.857ms     934.464us           109
+                                     aten::embedding         0.02%     304.330us         4.67%      94.034ms       7.836ms            12
+                                  aten::index_select         4.65%      93.670ms         4.66%      93.691ms       7.808ms            12
+                                          aten::mean         3.10%      62.403ms         3.10%      62.403ms       1.040ms            60
+                                          aten::silu         2.63%      52.992ms         2.63%      53.025ms       2.209ms            24
+                                           aten::pow         1.62%      32.613ms         1.63%      32.724ms     545.405us            60
+                                        aten::argmax         1.33%      26.751ms         1.33%      26.752ms       2.229ms            12
+                                    aten::contiguous         0.00%       2.875us         0.88%      17.687ms       8.843ms             2
+                                         aten::clone         0.00%      10.333us         0.88%      17.684ms       8.842ms             2
+                                           aten::mul         0.58%      11.755ms         0.59%      11.820ms      44.773us           264
+                                        aten::arange         0.22%       4.503ms         0.45%       9.020ms     375.819us            24
+                                           aten::add         0.42%       8.478ms         0.43%       8.689ms      55.702us           156
+----------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 2.013s
+
+Chrome trace written to /Users/andrei_zhulid/Development/AI-performance-engineering/gpu_and_inference_hw_CC/hw2/results/v1_optimized_trace.json
+Optimized: 128 tokens in 0.86s (149.0 tok/s)
+Token preview: [3544, 2993, 774, 537, 753, 1805, 1182, 1732]
+
+============================================================
+SUMMARY
+============================================================
+  Slow:       26.53s
+  Optimized:   0.86s
+  Speedup:    30.88x  (vs V0 slow baseline)

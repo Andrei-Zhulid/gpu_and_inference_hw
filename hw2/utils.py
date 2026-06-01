@@ -16,6 +16,34 @@ RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 
+def get_device():
+    """Pick the best available accelerator: CUDA, then Apple MPS, then CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = get_device()
+
+
+def synchronize():
+    """Device-agnostic barrier (no-op on CPU)."""
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    elif DEVICE.type == "mps":
+        torch.mps.synchronize()
+
+
+def empty_cache():
+    """Device-agnostic allocator cache release (no-op on CPU)."""
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+    elif DEVICE.type == "mps":
+        torch.mps.empty_cache()
+
+
 def build_model(dtype):
     """Create a tiny decoder-only model with real attention and KV cache."""
     torch.manual_seed(SEED)
@@ -33,22 +61,34 @@ def build_model(dtype):
         tie_word_embeddings=False,
     )
     model = LlamaForCausalLM(config)
-    model.to(device="cuda", dtype=dtype)
+    model.to(device=DEVICE, dtype=dtype)
     model.eval()
     return model
 
 
 def get_input_ids():
-    generator = torch.Generator(device="cuda")
+    if DEVICE.type == "cuda":
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(SEED)
+        return torch.randint(
+            low=0,
+            high=VOCAB_SIZE,
+            size=(1, PROMPT_LEN),
+            generator=generator,
+            device="cuda",
+            dtype=torch.long,
+        )
+    # MPS/CPU: the MPS RNG generator is limited, so draw on CPU then move.
+    generator = torch.Generator()
     generator.manual_seed(SEED)
-    return torch.randint(
+    ids = torch.randint(
         low=0,
         high=VOCAB_SIZE,
         size=(1, PROMPT_LEN),
         generator=generator,
-        device="cuda",
         dtype=torch.long,
     )
+    return ids.to(DEVICE)
 
 
 def slow_loop(model, input_ids, n_steps):
@@ -66,10 +106,10 @@ def slow_loop(model, input_ids, n_steps):
 
 def time_generation(loop_fn, model, input_ids, label):
     """Time loop_fn for MAX_NEW_TOKENS with proper GPU synchronization."""
-    torch.cuda.synchronize()
+    synchronize()
     start = time.perf_counter()
     generated_tokens = loop_fn(model, input_ids, MAX_NEW_TOKENS)
-    torch.cuda.synchronize()
+    synchronize()
     elapsed = time.perf_counter() - start
 
     preview = generated_tokens[:8]
