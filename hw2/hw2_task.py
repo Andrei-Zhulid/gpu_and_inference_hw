@@ -1,12 +1,12 @@
 import torch
 from torch.profiler import ProfilerActivity, profile as torch_profile
+
 from utils import (
     build_model,
     get_input_ids,
     slow_loop,
     time_generation,
     DEVICE,
-    empty_cache,
     synchronize,
     MODEL_NAME,
     PROFILE_STEPS,
@@ -66,7 +66,10 @@ def profile(loop_fn, model, input_ids, trace_name: str):
         with_stack=False,
     ) as prof:
         loop_fn(model, input_ids, PROFILE_STEPS)
-        synchronize()
+        if DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+        elif DEVICE.type == "mps":
+            torch.mps.synchronize()
 
     print(prof.key_averages().table(sort_by=sort_key, row_limit=20))
     trace_path = RESULTS_DIR / trace_name
@@ -97,7 +100,10 @@ def main():
     profile(slow_loop, model, input_ids, "v0_slow_trace.json")
     slow_elapsed = time_generation(slow_loop, model, input_ids, "Slow")
     del model
-    empty_cache()
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+    elif DEVICE.type == "mps":
+        torch.mps.empty_cache()
 
     print("\n--- Part 2: Optimized ---")
     optimized_elapsed = generate_optimized(optimized_trace_name="v1_optimized_trace.json")

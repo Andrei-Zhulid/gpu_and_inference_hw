@@ -36,14 +36,6 @@ def synchronize():
         torch.mps.synchronize()
 
 
-def empty_cache():
-    """Device-agnostic allocator cache release (no-op on CPU)."""
-    if DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
-    elif DEVICE.type == "mps":
-        torch.mps.empty_cache()
-
-
 def build_model(dtype):
     """Create a tiny decoder-only model with real attention and KV cache."""
     torch.manual_seed(SEED)

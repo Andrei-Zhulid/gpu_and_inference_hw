@@ -84,7 +84,7 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
     # Warmup (triggers torch.compile on first call, then warms caches)
     for _ in range(warmup):
         fn(*args)
-    _synchronize()
+    _synchronize() # CUDA: torch.cuda.synchronize(); MPS: torch.mps.synchronize()
 
     # L2 cache-flush buffer. Re-zeroing it before each timed run evicts whatever
     # the previous run left resident in L2, so every run pays a realistic memory
@@ -119,10 +119,10 @@ def benchmark_fn(fn, *args, warmup=25, rep=100) -> float:
         times_ms = []
         for _ in range(rep):
             cache_flush.zero_()
-            _synchronize()
+            _synchronize() # MPS: torch.mps.synchronize(); CPU: skip
             t0 = time.perf_counter()
             fn(*args)
-            _synchronize()
+            _synchronize() # MPS: torch.mps.synchronize(); CPU: skip
             times_ms.append((time.perf_counter() - t0) * 1e3)
 
     return statistics.median(times_ms)
